@@ -19,7 +19,7 @@ from app.internal.audiobookshelf.types import (
 )
 from app.internal.models import Audiobook
 from app.util.connection import USER_AGENT
-from app.util.db import get_session
+from app.util.db import commit_with_retry, get_session
 from app.util.log import logger
 
 
@@ -300,15 +300,26 @@ async def abs_mark_downloaded_flags(
     # Limit to avoid flooding ABS
     to_check = to_check[:25]
 
-    async def _check_and_mark(b: Audiobook):
+    async def _check(b: Audiobook) -> bool:
         try:
             exists = await abs_book_exists(session, client_session, b)
             logger.debug("ABS: exist check", asin=b.asin, exists=exists)
-            if exists:
-                b.downloaded = True
-                session.add(b)
+            return exists
         except Exception as e:
             logger.debug("ABS: failed exist check", asin=b.asin, error=str(e))
+            return False
 
-    await asyncio.gather(*[_check_and_mark(b) for b in to_check])
-    session.commit()
+    # Only modify books once every check is done. Marking them while checks
+    # are still awaiting would autoflush the change and hold SQLite's write
+    # lock across all the network calls, blocking other requests' commits.
+    results = await asyncio.gather(*[_check(b) for b in to_check])
+    found = [b for b, exists in zip(to_check, results) if exists]
+    if not found:
+        return
+
+    def mark_downloaded():
+        for b in found:
+            b.downloaded = True
+            session.add(b)
+
+    await commit_with_retry(session, mark_downloaded)

@@ -33,6 +33,7 @@ from app.internal.prowlarr.util import (
     prowlarr_source_cache,
 )
 from app.util.connection import USER_AGENT
+from app.util.db import commit_with_retry
 from app.util.log import logger
 
 
@@ -137,9 +138,14 @@ async def start_download(
 
         logger.debug("Download successfully started", guid=guid)
         if manual_book_request:
-            manual_book_request.downloaded = True
-            session.add(manual_book_request)
-            session.commit()
+
+            def mark_manual_downloaded():
+                manual_book_request.downloaded = True
+                session.add(manual_book_request)
+
+            # The download has already started, so notify even if saving fails.
+            # Otherwise downstream tools never learn about the download.
+            await commit_with_retry(session, mark_manual_downloaded)
             await send_all_manual_notifications(
                 EventEnum.on_successful_download,
                 manual_book_request,
@@ -149,10 +155,15 @@ async def start_download(
             same_books = session.exec(
                 select(Audiobook).where(Audiobook.asin == asin_or_uuid)
             ).all()
-            for b in same_books:
-                b.downloaded = True
-                session.add(b)
-            session.commit()
+
+            def mark_downloaded():
+                for b in same_books:
+                    b.downloaded = True
+                    session.add(b)
+
+            # The download has already started, so notify even if saving fails.
+            # Otherwise downstream tools never learn about the download.
+            await commit_with_retry(session, mark_downloaded)
 
             await send_all_notifications(
                 EventEnum.on_successful_download,
